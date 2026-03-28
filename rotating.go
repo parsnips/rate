@@ -2,7 +2,6 @@ package rate
 
 import (
 	"hash/maphash"
-	"math"
 	"sync/atomic"
 	"time"
 
@@ -19,6 +18,12 @@ type rotatingPair struct {
 	checked *TokenBucketLimiter
 	ignored *TokenBucketLimiter
 	rotated time56.Time
+}
+
+type refillState struct {
+	refillRate       float64
+	nanosPerToken    int64
+	nanosPerRotation int64
 }
 
 // RotatingTokenBucketLimiter implements a collision-resistant token
@@ -41,12 +46,10 @@ type rotatingPair struct {
 // last for the duration of the rotation period, providing better
 // fairness and accuracy compared to a single TokenBucketLimiter.
 type RotatingTokenBucketLimiter struct {
-	pair             atomic.Pointer[rotatingPair] // Current limiter pair
-	burstCapacity    uint8
-	refillRateUnit   time.Duration
-	refillRateBits   atomic.Uint64
-	nanosPerToken    atomic.Int64
-	nanosPerRotation atomic.Int64
+	pair           atomic.Pointer[rotatingPair] // Current limiter pair
+	burstCapacity  uint8
+	refillRateUnit time.Duration
+	state          atomic.Pointer[refillState]
 }
 
 // Compile-time assertion that RotatingTokenBucketLimiter implements Limiter
@@ -164,13 +167,13 @@ func NewRotatingTokenBucketLimiter(
 // This approach ensures that hash collisions are resolved
 // periodically without affecting the thread-safety or performance of
 // the limiter.
-func (r *RotatingTokenBucketLimiter) load(nowNS int64) *rotatingPair {
+func (r *RotatingTokenBucketLimiter) load(nowNS int64, state *refillState) *rotatingPair {
 	now := time56.Unix(nowNS)
 
 	for {
 		pair := r.pair.Load()
 
-		if now.Since(pair.rotated) < r.nanosPerRotation.Load() {
+		if now.Since(pair.rotated) < state.nanosPerRotation {
 			return pair
 		}
 
@@ -227,8 +230,9 @@ func (r *RotatingTokenBucketLimiter) CheckToken(id []byte) bool {
 // multiple goroutines.
 func (r *RotatingTokenBucketLimiter) CheckTokens(id []byte, n uint8) bool {
 	now := nowfn()
-	pair := r.load(now)
-	rate := r.nanosPerToken.Load()
+	state := r.loadRefillState()
+	pair := r.load(now, state)
+	rate := state.nanosPerToken
 	pair.ignored.checkInner(pair.ignored.index(id), rate, now, n)
 	return pair.checked.checkInner(pair.checked.index(id), rate, now, n)
 }
@@ -281,8 +285,9 @@ func (r *RotatingTokenBucketLimiter) TakeToken(id []byte) bool {
 // multiple goroutines.
 func (r *RotatingTokenBucketLimiter) TakeTokens(id []byte, n uint8) bool {
 	now := nowfn()
-	pair := r.load(now)
-	rate := r.nanosPerToken.Load()
+	state := r.loadRefillState()
+	pair := r.load(now, state)
+	rate := state.nanosPerToken
 	pair.ignored.takeTokenInner(pair.ignored.index(id), rate, now, n)
 	return pair.checked.takeTokenInner(pair.checked.index(id), rate, now, n)
 }
@@ -302,7 +307,7 @@ func (r *RotatingTokenBucketLimiter) SetRefillRate(refillRate float64) error {
 // RefillRate returns the current refill rate in tokens per
 // refillRateUnit.
 func (r *RotatingTokenBucketLimiter) RefillRate() float64 {
-	return math.Float64frombits(r.refillRateBits.Load())
+	return r.loadRefillState().refillRate
 }
 
 // RotationInterval returns the automatically calculated rotation
@@ -317,13 +322,19 @@ func (r *RotatingTokenBucketLimiter) RefillRate() float64 {
 // This method is thread-safe and can be called concurrently from
 // multiple goroutines.
 func (r *RotatingTokenBucketLimiter) RotationInterval() time.Duration {
-	return time.Duration(r.nanosPerRotation.Load())
+	return time.Duration(r.loadRefillState().nanosPerRotation)
 }
 
 func (r *RotatingTokenBucketLimiter) setRefillRateState(refillRate float64) {
-	r.refillRateBits.Store(math.Float64bits(refillRate))
-	r.nanosPerToken.Store(nanoRate(r.refillRateUnit, refillRate))
-	r.nanosPerRotation.Store(calculateRotationInterval(r.burstCapacity, refillRate, r.refillRateUnit).Nanoseconds())
+	r.state.Store(&refillState{
+		refillRate:       refillRate,
+		nanosPerToken:    nanoRate(r.refillRateUnit, refillRate),
+		nanosPerRotation: calculateRotationInterval(r.burstCapacity, refillRate, r.refillRateUnit).Nanoseconds(),
+	})
+}
+
+func (r *RotatingTokenBucketLimiter) loadRefillState() *refillState {
+	return r.state.Load()
 }
 
 func calculateRotationInterval(burstCapacity uint8, refillRate float64, refillRateUnit time.Duration) time.Duration {

@@ -230,13 +230,13 @@ func TestRotatingTokenBucketLimiterRotation(t *testing.T) {
 	}
 
 	// Load initial pair
-	pair1 := limiter.load(nowfn())
+	pair1 := limiter.load(nowfn(), limiter.loadRefillState())
 	if pair1 == nil {
 		t.Fatal("Expected non-nil pair")
 	}
 
 	// Before rotation period, should get same pair
-	pair2 := limiter.load(nowfn())
+	pair2 := limiter.load(nowfn(), limiter.loadRefillState())
 	if pair1 != pair2 {
 		t.Error("Should get same pair before rotation period")
 	}
@@ -244,7 +244,7 @@ func TestRotatingTokenBucketLimiterRotation(t *testing.T) {
 	// After rotation period, should get new pair
 	// With burstCapacity=10, refillRate=1.0/sec: rotation = 10/1.0 * 5 = 50 seconds
 	tick(50*time.Second + 1*time.Millisecond)
-	pair3 := limiter.load(nowfn())
+	pair3 := limiter.load(nowfn(), limiter.loadRefillState())
 	if pair1 == pair3 {
 		t.Error("Should get different pair after rotation period")
 	}
@@ -277,7 +277,7 @@ func TestRotatingTokenBucketLimiterCollisionAvoidance(t *testing.T) {
 	id1 := []byte("collision-test-1")
 	id2 := []byte("collision-test-2")
 
-	pair := limiter.load(nowfn())
+	pair := limiter.load(nowfn(), limiter.loadRefillState())
 	index1 := pair.checked.index(id1)
 	index2 := pair.checked.index(id2)
 
@@ -421,13 +421,13 @@ func TestRotatingTokenBucketLimiterLoadLogic(t *testing.T) {
 	now := nowfn()
 
 	// First load should return initial pair
-	pair1 := limiter.load(now)
+	pair1 := limiter.load(now, limiter.loadRefillState())
 	if pair1 == nil {
 		t.Fatal("Expected non-nil pair")
 	}
 
 	// Load with same timestamp should return same pair
-	pair2 := limiter.load(now)
+	pair2 := limiter.load(now, limiter.loadRefillState())
 	if pair1 != pair2 {
 		t.Error("Same timestamp should return same pair")
 	}
@@ -436,14 +436,14 @@ func TestRotatingTokenBucketLimiterLoadLogic(t *testing.T) {
 	// With burstCapacity=10, refillRate=1.0/sec: rotation = 10/1.0 * 5 = 50 seconds
 	rotationInterval := 50 * time.Second
 	beforeRotation := now + rotationInterval.Nanoseconds() - 1
-	pair3 := limiter.load(beforeRotation)
+	pair3 := limiter.load(beforeRotation, limiter.loadRefillState())
 	if pair1 != pair3 {
 		t.Error("Before rotation timestamp should return same pair")
 	}
 
 	// Load with timestamp at rotation should trigger rotation
 	atRotation := now + rotationInterval.Nanoseconds()
-	pair4 := limiter.load(atRotation)
+	pair4 := limiter.load(atRotation, limiter.loadRefillState())
 	if pair1 == pair4 {
 		t.Error("At rotation timestamp should return new pair")
 	}
@@ -560,7 +560,7 @@ func TestRotatingTokenBucketLimiterSetRefillRateUpdatesRotationInterval(t *testi
 		t.Fatalf("Failed to create limiter: %v", err)
 	}
 
-	pair1 := limiter.load(nowfn())
+	pair1 := limiter.load(nowfn(), limiter.loadRefillState())
 	if got := limiter.RotationInterval(); got != 50*time.Second {
 		t.Fatalf("Expected initial rotation interval of 50s, got %v", got)
 	}
@@ -577,9 +577,40 @@ func TestRotatingTokenBucketLimiterSetRefillRateUpdatesRotationInterval(t *testi
 	}
 
 	tick(500*time.Millisecond + time.Millisecond)
-	pair2 := limiter.load(nowfn())
+	pair2 := limiter.load(nowfn(), limiter.loadRefillState())
 	if pair1 == pair2 {
 		t.Fatal("Expected limiter to rotate using the updated interval")
+	}
+}
+
+func TestRotatingTokenBucketLimiterLoadUsesStateSnapshot(t *testing.T) {
+	limiter, err := NewRotatingTokenBucketLimiter(
+		rotatingNumBuckets,
+		rotatingBurstCapacity,
+		1.0,
+		time.Second,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create limiter: %v", err)
+	}
+
+	now := nowfn()
+	initialState := limiter.loadRefillState()
+	initialPair := limiter.load(now, initialState)
+
+	if err := limiter.SetRefillRate(100.0); err != nil {
+		t.Fatalf("SetRefillRate failed: %v", err)
+	}
+
+	updatedState := limiter.loadRefillState()
+	atUpdatedRotation := now + updatedState.nanosPerRotation
+
+	if pair := limiter.load(atUpdatedRotation, initialState); pair != initialPair {
+		t.Fatal("Expected old state snapshot to keep using the old rotation interval")
+	}
+
+	if pair := limiter.load(atUpdatedRotation, updatedState); pair == initialPair {
+		t.Fatal("Expected updated state snapshot to rotate using the new interval")
 	}
 }
 
@@ -594,7 +625,7 @@ func TestRotatingTokenBucketLimiterDifferentIDs(t *testing.T) {
 	id2 := []byte("different-id-2")
 
 	// Check if these IDs hash to the same bucket (hash collision)
-	pair := limiter.load(nowfn())
+	pair := limiter.load(nowfn(), limiter.loadRefillState())
 	index1 := pair.checked.index(id1)
 	index2 := pair.checked.index(id2)
 
