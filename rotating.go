@@ -109,18 +109,14 @@ func NewRotatingTokenBucketLimiter(
 		return nil, err
 	}
 
-	checked, err := NewTokenBucketLimiter(
+	// Validation passed above, and NewTokenBucketLimiter currently has no
+	// additional error cases beyond parameter validation.
+	checked, _ := NewTokenBucketLimiter(
 		numBuckets,
 		burstCapacity,
 		refillRate,
 		refillRateUnit,
 	)
-	if err != nil {
-		return nil, err
-	}
-
-	// validation passed for exact params above, continue w/o checking
-	// error for 100% coverage.
 
 	ignored, _ := NewTokenBucketLimiter(
 		numBuckets,
