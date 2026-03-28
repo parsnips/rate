@@ -94,6 +94,21 @@ func TestRotatingTokenBucketLimiterCreation(t *testing.T) {
 	}
 }
 
+func TestRotatingTokenBucketLimiterSetRefillRateValidation(t *testing.T) {
+	limiter, err := DefaultRotatingLimiter()
+	if err != nil {
+		t.Fatalf("Failed to create limiter: %v", err)
+	}
+
+	if err := limiter.SetRefillRate(0); err == nil {
+		t.Fatal("Expected error for zero refill rate")
+	}
+
+	if got := limiter.RefillRate(); got != rotatingRatePerSecond {
+		t.Fatalf("Expected refill rate to remain %v after failed update, got %v", rotatingRatePerSecond, got)
+	}
+}
+
 // TestRotatingTokenBucketLimiterBasicFunctionality tests basic token operations
 func TestRotatingTokenBucketLimiterBasicFunctionality(t *testing.T) {
 	limiter, err := DefaultRotatingLimiter()
@@ -125,6 +140,69 @@ func TestRotatingTokenBucketLimiterBasicFunctionality(t *testing.T) {
 
 	if !limiter.TakeToken(id) {
 		t.Error("Should be able to take token after refill")
+	}
+}
+
+func TestRotatingTokenBucketLimiterSetRefillRatePreservesState(t *testing.T) {
+	limiter, err := NewRotatingTokenBucketLimiter(
+		rotatingNumBuckets,
+		1,
+		10.0,
+		time.Second,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create limiter: %v", err)
+	}
+
+	id := []byte("adjustable-rate-state")
+	if !limiter.TakeToken(id) {
+		t.Fatal("Expected first token to succeed")
+	}
+	if limiter.TakeToken(id) {
+		t.Fatal("Expected bucket to be empty after first token")
+	}
+
+	if err := limiter.SetRefillRate(1.0); err != nil {
+		t.Fatalf("SetRefillRate failed: %v", err)
+	}
+	if limiter.TakeToken(id) {
+		t.Fatal("Expected state to be preserved after refill rate change")
+	}
+
+	tick(100 * time.Millisecond)
+	if limiter.TakeToken(id) {
+		t.Fatal("Expected slower refill rate to delay token availability")
+	}
+
+	tick(900 * time.Millisecond)
+	if !limiter.TakeToken(id) {
+		t.Fatal("Expected token after one second at the new refill rate")
+	}
+}
+
+func TestRotatingTokenBucketLimiterSetRefillRateSpeedsRefill(t *testing.T) {
+	limiter, err := NewRotatingTokenBucketLimiter(
+		rotatingNumBuckets,
+		1,
+		1.0,
+		time.Second,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create limiter: %v", err)
+	}
+
+	id := []byte("adjustable-rate-fast")
+	if !limiter.TakeToken(id) {
+		t.Fatal("Expected first token to succeed")
+	}
+
+	if err := limiter.SetRefillRate(10.0); err != nil {
+		t.Fatalf("SetRefillRate failed: %v", err)
+	}
+
+	tick(100 * time.Millisecond)
+	if !limiter.TakeToken(id) {
+		t.Fatal("Expected faster refill rate to make token available sooner")
 	}
 }
 
@@ -468,6 +546,40 @@ func TestRotatingTokenBucketLimiterRotationInterval(t *testing.T) {
 				t.Errorf("Expected rotation interval %v, got %v", tt.expectedInterval, actualInterval)
 			}
 		})
+	}
+}
+
+func TestRotatingTokenBucketLimiterSetRefillRateUpdatesRotationInterval(t *testing.T) {
+	limiter, err := NewRotatingTokenBucketLimiter(
+		rotatingNumBuckets,
+		rotatingBurstCapacity,
+		1.0,
+		time.Second,
+	)
+	if err != nil {
+		t.Fatalf("Failed to create limiter: %v", err)
+	}
+
+	pair1 := limiter.load(nowfn())
+	if got := limiter.RotationInterval(); got != 50*time.Second {
+		t.Fatalf("Expected initial rotation interval of 50s, got %v", got)
+	}
+
+	if err := limiter.SetRefillRate(100.0); err != nil {
+		t.Fatalf("SetRefillRate failed: %v", err)
+	}
+
+	if got := limiter.RefillRate(); got != 100.0 {
+		t.Fatalf("Expected refill rate of 100, got %v", got)
+	}
+	if got := limiter.RotationInterval(); got != 500*time.Millisecond {
+		t.Fatalf("Expected updated rotation interval of 500ms, got %v", got)
+	}
+
+	tick(500*time.Millisecond + time.Millisecond)
+	pair2 := limiter.load(nowfn())
+	if pair1 == pair2 {
+		t.Fatal("Expected limiter to rotate using the updated interval")
 	}
 }
 
